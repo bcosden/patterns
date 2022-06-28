@@ -2,7 +2,7 @@
 
 # VARIABLES
 loc="eastus"
-rg="b2broute"
+rg="1hub-bgp"
 
 BLACK="\033[30m"
 RED="\033[31m"
