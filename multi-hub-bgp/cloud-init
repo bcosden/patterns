@@ -1,0 +1,114 @@
+#!/bin/bash
+
+## NOTE:
+## before running the script, customize the values of variables suitable for your deployment. 
+## asn_frr: Autonomous system number assigned to frr
+## bgp_routerId: IP address of frr VM
+## bgp_network1: first network advertised from frr to the router server (inclusive of subnetmask)
+## bgp_network2: second network advertised from frr to the router server (inclusive of subnetmask)
+## bgp_network3: third network advertised from frr to the router server (inclusive of subnetmask)
+## routeserver_IP1: first IP address of the router server 
+## routeserver_IP2: second IP address of the router server
+
+asn_frr=65002
+bgp_routerId=10.5.4.10
+bgp_network1=10.101.1.0/24
+bgp_network2=10.101.2.0/24
+bgp_network3=0.0.0.0/0
+routeserver_IP1=10.5.1.4
+routeserver_IP2=10.5.1.5
+routeserver2_IP1=10.7.1.4
+routeserver2_IP2=10.7.1.5
+nexthopip=10.5.4.10
+
+## Install the frr routing daemon
+echo "Installing frr"
+curl -s https://deb.frrouting.org/frr/keys.asc | sudo apt-key add -
+FRRVER="frr-stable"
+echo deb https://deb.frrouting.org/frr $(lsb_release -s -c) $FRRVER | sudo tee -a /etc/apt/sources.list.d/frr.list
+
+apt-get -y update
+
+apt-get -y install frr frr-pythontools
+
+echo "Installing IPTables-Persistent"
+echo iptables-persistent iptables-persistent/autosave_v4 boolean false | sudo debconf-set-selections
+echo iptables-persistent iptables-persistent/autosave_v6 boolean false | sudo debconf-set-selections
+apt-get -y install iptables-persistent
+
+##  run the updates and ensure the packages are up to date and there is no new version available for the packages
+apt-get -y update --fix-missing
+
+## Enable IPv4 forwarding
+echo "net.ipv4.conf.all.forwarding=1" | tee -a /etc/sysctl.conf 
+echo "net.ipv4.conf.default.forwarding=1" | tee -a /etc/sysctl.conf 
+sysctl -p
+
+# Enable NAT to Internet
+iptables -t nat -A POSTROUTING -d 10.0.0.0/8 -j ACCEPT
+iptables -t nat -A POSTROUTING -d 172.16.0.0/12 -j ACCEPT
+iptables -t nat -A POSTROUTING -d 192.168.0.0/16 -j ACCEPT
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+# Enable forwarding between internal to external interface
+iptables -A FORWARD -i eth0 -o eth1 -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT
+
+# Save to IPTables file for persistence on reboot
+iptables-save > /etc/iptables/rules.v4
+
+# Add static route for private address space (RFC1918)
+# Route all private space to internal interface
+route add -net 10.0.0.0/8 gw 10.5.4.1 dev eth1
+
+# Setup static route to persist between reboots
+echo "#!/bin/bash" > /etc/rc.local
+echo "route add -net 10.0.0.0/8 gw 10.5.4.1 metric 0 dev eth1" >> /etc/rc.local
+chmod +x /etc/rc.local
+
+## Create the configuration files for frr daemon
+echo "add bgpd in daemon config file"
+sed -i 's/bgpd=no/bgpd=yes/g' /etc/frr/daemons
+
+echo "add FRR config"
+cat <<EOF > /etc/frr/frr.conf
+!
+router bgp $asn_frr
+ bgp router-id $bgp_routerId
+ no bgp ebgp-requires-policy
+ network $bgp_network1
+ network $bgp_network2
+ network $bgp_network3
+ neighbor $routeserver_IP1 remote-as 65515
+ neighbor $routeserver_IP1 soft-reconfiguration inbound
+ neighbor $routeserver_IP1 route-map nexthop out
+ neighbor $routeserver_IP2 remote-as 65515
+ neighbor $routeserver_IP2 soft-reconfiguration inbound
+ neighbor $routeserver_IP2 route-map nexthop out
+ neighbor $routeserver2_IP1 remote-as 65515
+ neighbor $routeserver2_IP1 soft-reconfiguration inbound
+ neighbor $routeserver2_IP1 route-map nexthop out
+ neighbor $routeserver2_IP2 remote-as 65515
+ neighbor $routeserver2_IP2 soft-reconfiguration inbound
+ neighbor $routeserver2_IP2 route-map nexthop out
+!
+ address-family ipv6
+ exit-address-family
+ exit
+!
+route-map nexthop permit 10
+ set ip next-hop $nexthopip
+!
+line vty
+!
+EOF
+
+## to start daemons at system startup
+echo "enable frr at system startup"
+systemctl enable frr
+
+## run the daemons
+echo "start frr daemons"
+systemctl restart frr
+
+sudo adduser azureuser frrvty
+sudo adduser azureuser frr
